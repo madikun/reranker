@@ -1,3 +1,4 @@
+import os
 import time
 import logging
 from contextlib import asynccontextmanager
@@ -10,7 +11,7 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = "BAAI/bge-reranker-v2-m3"
+MODEL_NAME = os.environ.get("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
 MAX_DOCUMENTS = 50
 
 model = None
