@@ -4,36 +4,56 @@ import logging
 from contextlib import asynccontextmanager
 
 import torch
+import torch.nn.functional as F
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from transformers import AutoModel, AutoModelForSequenceClassification, AutoTokenizer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = os.environ.get("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+RERANKER_MODEL = os.environ.get("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "intfloat/multilingual-e5-small")
 MAX_DOCUMENTS = 50
+MAX_TEXTS = 100
 
-model = None
-tokenizer = None
+reranker = None
+reranker_tokenizer = None
+embedder = None
+embedder_tokenizer = None
+
+
+def _get_device():
+    if torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global model, tokenizer
-    logger.info("Loading model %s ...", MODEL_NAME)
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
-    model.eval()
-    if torch.backends.mps.is_available():
-        model = model.to("mps")
-        logger.info("Using MPS (Apple Silicon) backend")
-    logger.info("Model loaded")
+    global reranker, reranker_tokenizer, embedder, embedder_tokenizer
+    device = _get_device()
+
+    logger.info("Loading reranker %s ...", RERANKER_MODEL)
+    reranker_tokenizer = AutoTokenizer.from_pretrained(RERANKER_MODEL)
+    reranker = AutoModelForSequenceClassification.from_pretrained(RERANKER_MODEL)
+    reranker.eval().to(device)
+
+    logger.info("Loading embedder %s ...", EMBED_MODEL)
+    embedder_tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL)
+    embedder = AutoModel.from_pretrained(EMBED_MODEL)
+    embedder.eval().to(device)
+
+    logger.info("Models loaded on %s", device)
     yield
 
 
-app = FastAPI(title="Reranker Service", lifespan=lifespan)
+app = FastAPI(title="Reranker & Embedding Service", lifespan=lifespan)
 
+
+# --- Models ---
 
 class Document(BaseModel):
     id: str
@@ -57,9 +77,26 @@ class RerankResponse(BaseModel):
     results: list[RerankResult]
 
 
+class EmbedRequest(BaseModel):
+    texts: list[str]
+
+
+class EmbedResponse(BaseModel):
+    model: str
+    dimensions: int
+    embeddings: list[list[float]]
+
+
+# --- Endpoints ---
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": MODEL_NAME, "ready": model is not None}
+    return {
+        "status": "ok",
+        "reranker": RERANKER_MODEL,
+        "embedder": EMBED_MODEL,
+        "ready": reranker is not None and embedder is not None,
+    }
 
 
 @app.post("/rerank", response_model=RerankResponse)
@@ -70,19 +107,19 @@ def rerank(req: RerankRequest):
         raise HTTPException(400, f"too many documents, max {MAX_DOCUMENTS}")
 
     start = time.perf_counter()
-    device = next(model.parameters()).device
+    device = next(reranker.parameters()).device
 
     pairs = [[req.query, doc.text] for doc in req.documents]
 
     with torch.no_grad():
-        inputs = tokenizer(
+        inputs = reranker_tokenizer(
             pairs,
             padding=True,
             truncation=True,
             max_length=1024,
             return_tensors="pt",
         ).to(device)
-        scores = model(**inputs, return_dict=True).logits.view(-1).float()
+        scores = reranker(**inputs, return_dict=True).logits.view(-1).float()
 
     scores = scores.cpu().tolist()
 
@@ -107,7 +144,51 @@ def rerank(req: RerankRequest):
         latency,
     )
 
-    return RerankResponse(model=MODEL_NAME, results=results)
+    return RerankResponse(model=RERANKER_MODEL, results=results)
+
+
+@app.post("/embed", response_model=EmbedResponse)
+def embed(req: EmbedRequest):
+    if not req.texts:
+        raise HTTPException(400, "texts list is empty")
+    if len(req.texts) > MAX_TEXTS:
+        raise HTTPException(400, f"too many texts, max {MAX_TEXTS}")
+
+    start = time.perf_counter()
+    device = next(embedder.parameters()).device
+
+    # multilingual-e5 models expect "query: " or "passage: " prefix
+    prefixed = [f"passage: {t}" for t in req.texts]
+
+    with torch.no_grad():
+        inputs = embedder_tokenizer(
+            prefixed,
+            padding=True,
+            truncation=True,
+            max_length=512,
+            return_tensors="pt",
+        ).to(device)
+        output = embedder(**inputs)
+        # mean pooling
+        mask = inputs["attention_mask"].unsqueeze(-1).float()
+        vectors = (output.last_hidden_state * mask).sum(1) / mask.sum(1)
+        vectors = F.normalize(vectors, p=2, dim=1)
+
+    embeddings = vectors.cpu().tolist()
+
+    latency = time.perf_counter() - start
+    logger.info(
+        "embed texts=%d dimensions=%d latency=%.3fs",
+        len(req.texts),
+        len(embeddings[0]),
+        latency,
+    )
+
+    return EmbedResponse(
+        model=EMBED_MODEL,
+        dimensions=len(embeddings[0]),
+        embeddings=embeddings,
+    )
 
 
 if __name__ == "__main__":
